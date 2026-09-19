@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Resolve a YouTube live stream via yt-dlp and relay it to a UDP multicast
+# address with ffmpeg. Intended to be run as `streamer@<name>`, reading
+# config from /etc/streamer/<name>.conf.
+#
+# Runs under `Restart=always`: yt-dlp's signed googlevideo URLs expire after
+# a few hours, and ffmpeg has no way to refresh them mid-stream, so the
+# service is expected to exit periodically and simply re-resolve on restart.
+set -euo pipefail
+
+INSTANCE="${1:?usage: youtube-udp-streamer <instance-name>}"
+CONF="/etc/streamer/${INSTANCE}.conf"
+
+if [ ! -r "$CONF" ]; then
+    echo "Config not found or not readable: $CONF" >&2
+    exit 1
+fi
+
+# shellcheck disable=SC1090
+source "$CONF"
+
+: "${YOUTUBE_URL:?YOUTUBE_URL not set in $CONF}"
+: "${UDP_OUT:?UDP_OUT not set in $CONF}"
+: "${VIDEO_FORMAT:?VIDEO_FORMAT not set in $CONF}"
+: "${AUDIO_FORMAT:?AUDIO_FORMAT not set in $CONF}"
+
+YTDLP_BIN="${YTDLP_BIN:-$HOME/src/yt-dlp/yt-dlp}"
+FFMPEG_LOGLEVEL="${FFMPEG_LOGLEVEL:-warning}"
+
+if [ ! -x "$YTDLP_BIN" ]; then
+    echo "yt-dlp binary not found or not executable: $YTDLP_BIN" >&2
+    exit 1
+fi
+
+echo "Resolving stream URLs for instance '$INSTANCE' from $YOUTUBE_URL"
+
+VIDEO_URL=$("$YTDLP_BIN" -f "$VIDEO_FORMAT" -g "$YOUTUBE_URL")
+AUDIO_URL=$("$YTDLP_BIN" -f "$AUDIO_FORMAT" -g "$YOUTUBE_URL")
+
+if [ -z "$VIDEO_URL" ] || [ -z "$AUDIO_URL" ]; then
+    echo "yt-dlp returned an empty URL (video or audio); is the stream live?" >&2
+    exit 1
+fi
+
+echo "Relaying to $UDP_OUT"
+
+exec ffmpeg -nostdin -loglevel "$FFMPEG_LOGLEVEL" \
+    -i "$VIDEO_URL" \
+    -i "$AUDIO_URL" \
+    -c copy -f mpegts "$UDP_OUT"
