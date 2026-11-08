@@ -6,6 +6,7 @@
 # Runs under `Restart=always`: yt-dlp's signed googlevideo URLs expire after
 # a few hours, and ffmpeg has no way to refresh them mid-stream, so the
 # service is expected to exit periodically and simply re-resolve on restart.
+# A watchdog stops ffmpeg if it stalls without exiting, so it restarts too.
 set -euo pipefail
 
 INSTANCE="${1:?usage: youtube-udp-streamer <instance-name>}"
@@ -19,6 +20,10 @@ fi
 # shellcheck disable=SC1090
 source "$CONF"
 
+if [ "${TYPE:-youtube}" = "teletext" ]; then
+    exec /usr/local/bin/teletext-udp-streamer "$INSTANCE"
+fi
+
 : "${YOUTUBE_URL:?YOUTUBE_URL not set in $CONF}"
 : "${UDP_OUT:?UDP_OUT not set in $CONF}"
 : "${VIDEO_FORMAT:?VIDEO_FORMAT not set in $CONF}"
@@ -26,6 +31,43 @@ source "$CONF"
 
 YTDLP_BIN="${YTDLP_BIN:-$HOME/src/yt-dlp/yt-dlp}"
 FFMPEG_LOGLEVEL="${FFMPEG_LOGLEVEL:-warning}"
+# Seconds without any new output before ffmpeg is considered stalled.
+STALL_TIMEOUT="${STALL_TIMEOUT:-60}"
+
+# Run an ffmpeg command that writes `-progress pipe:1` to stdout, and kill it if
+# its output size stops growing for STALL_TIMEOUT seconds. ffmpeg can hang
+# forever on a dead HLS source (DNS failure, expired URL) without exiting, so
+# `Restart=always` alone never kicks in.
+relay_with_watchdog() {
+    local ffmpeg_pid key value status
+    local last_size="" last_change=$SECONDS
+
+    exec 3< <(exec "$@")
+    ffmpeg_pid=$!
+
+    while true; do
+        if IFS== read -r -t 5 key value <&3; then
+            if [ "$key" = total_size ] && [ "$value" != "$last_size" ]; then
+                last_size=$value
+                last_change=$SECONDS
+            fi
+        elif [ $? -le 128 ]; then
+            break # EOF: ffmpeg exited
+        fi
+
+        if [ $((SECONDS - last_change)) -ge "$STALL_TIMEOUT" ]; then
+            echo "No output for ${STALL_TIMEOUT}s; stopping ffmpeg so the service restarts" >&2
+            kill "$ffmpeg_pid" 2>/dev/null || true
+            sleep 5
+            kill -KILL "$ffmpeg_pid" 2>/dev/null || true
+            return 1
+        fi
+    done
+
+    status=0
+    wait "$ffmpeg_pid" || status=$?
+    return "$status"
+}
 
 if [ ! -x "$YTDLP_BIN" ]; then
     echo "yt-dlp binary not found or not executable: $YTDLP_BIN" >&2
@@ -44,7 +86,8 @@ fi
 
 echo "Relaying to $UDP_OUT"
 
-exec ffmpeg -nostdin -loglevel "$FFMPEG_LOGLEVEL" \
-    -i "$VIDEO_URL" \
+relay_with_watchdog ffmpeg -nostdin -loglevel "$FFMPEG_LOGLEVEL" \
+    -progress pipe:1 -nostats \
+    -c:v h264_v4l2m2m -i "$VIDEO_URL" \
     -i "$AUDIO_URL" \
     -c copy -f mpegts "$UDP_OUT"
